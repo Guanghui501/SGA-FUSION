@@ -251,6 +251,208 @@ class MiddleFusionModule(nn.Module):
         return enhanced
 
 
+class MiddleFusionWithAttention(nn.Module):
+    """Enhanced middle fusion module with attention mechanism for interpretability.
+
+    This module combines the efficiency of middle fusion with fine-grained
+    atom-to-text attention weights for interpretability. It allows you to:
+    1. Maintain high accuracy of middle fusion
+    2. Visualize which text tokens each atom attends to
+    3. Extract attention weights for explainability analysis
+
+    Key differences from original MiddleFusionModule:
+    - Uses multi-head attention instead of simple broadcasting
+    - Computes atom-to-text attention weights
+    - Supports both attention-only and hybrid (attention + gate) modes
+    """
+
+    def __init__(self, node_dim=64, text_token_dim=768, hidden_dim=128,
+                 num_heads=4, dropout=0.1, use_gate=True, use_projection=True):
+        """Initialize middle fusion with attention.
+
+        Args:
+            node_dim: Dimension of graph node features
+            text_token_dim: Dimension of text token features (768 for BERT)
+            hidden_dim: Hidden dimension for attention computation
+            num_heads: Number of attention heads (default: 4 for efficiency)
+            dropout: Dropout rate
+            use_gate: Whether to use additional gating mechanism (hybrid mode)
+            use_projection: Whether to project token features to hidden_dim
+        """
+        super().__init__()
+        self.node_dim = node_dim
+        self.text_token_dim = text_token_dim
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.use_gate = use_gate
+        self.use_projection = use_projection
+
+        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+
+        # Input projections
+        if use_projection:
+            self.node_proj_in = nn.Linear(node_dim, hidden_dim)
+            self.token_proj_in = nn.Linear(text_token_dim, hidden_dim)
+
+        # Atom-to-Token attention (atoms query text tokens)
+        self.a2t_query = nn.Linear(hidden_dim if use_projection else node_dim, hidden_dim)
+        self.a2t_key = nn.Linear(hidden_dim if use_projection else text_token_dim, hidden_dim)
+        self.a2t_value = nn.Linear(hidden_dim if use_projection else text_token_dim, hidden_dim)
+
+        # Output projection
+        self.output_proj = nn.Linear(hidden_dim, node_dim)
+
+        # Optional gating mechanism for hybrid mode
+        if use_gate:
+            self.gate = nn.Sequential(
+                nn.Linear(node_dim * 2, node_dim),
+                nn.Sigmoid()
+            )
+
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(node_dim)
+        self.scale = self.head_dim ** -0.5
+
+        # Store attention weights for visualization
+        self.last_attention_weights = None
+
+    def split_heads(self, x):
+        """Split the last dimension into (num_heads, head_dim).
+
+        Args:
+            x: [batch_size, seq_len, hidden_dim]
+        Returns:
+            [batch_size, num_heads, seq_len, head_dim]
+        """
+        batch_size, seq_len, _ = x.size()
+        x = x.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        return x.permute(0, 2, 1, 3)  # (batch, heads, seq, head_dim)
+
+    def forward(self, node_feat, text_tokens, batch_num_nodes=None,
+                token_mask=None, return_attention=False):
+        """Apply middle fusion with attention mechanism.
+
+        Args:
+            node_feat: Node features [total_nodes, node_dim] (for batched graphs)
+                      or [batch_size, node_dim] (for pooled features)
+            text_tokens: Text token features [batch_size, seq_len, text_token_dim]
+            batch_num_nodes: List of number of nodes in each graph (required for batched graphs)
+            token_mask: Optional mask for padded tokens [batch_size, seq_len]
+            return_attention: Whether to return attention weights
+
+        Returns:
+            enhanced_nodes: Enhanced node features with same shape as input
+            attention_weights: (optional) Attention weights [batch, num_heads, num_atoms, seq_len]
+        """
+        batch_size = text_tokens.size(0)
+        seq_len = text_tokens.size(1)
+        num_nodes = node_feat.size(0)
+
+        # Store original features for residual connection
+        node_feat_orig = node_feat
+
+        # === Step 1: Convert DGL batched format to standard batch format ===
+        if num_nodes != batch_size:
+            # Batched graphs: need to convert to [batch_size, max_atoms, node_dim]
+            if batch_num_nodes is None:
+                raise ValueError("batch_num_nodes is required for batched graphs")
+
+            max_atoms = max(batch_num_nodes)
+            node_feat_batched = torch.zeros(
+                batch_size, max_atoms, self.node_dim,
+                dtype=node_feat.dtype, device=node_feat.device
+            )
+
+            # Create node mask
+            node_mask = torch.zeros(batch_size, max_atoms, dtype=torch.bool, device=node_feat.device)
+
+            # Fill in actual node features
+            start_idx = 0
+            for i, num in enumerate(batch_num_nodes):
+                node_feat_batched[i, :num] = node_feat[start_idx:start_idx + num]
+                node_mask[i, :num] = True
+                start_idx += num
+
+            num_atoms = max_atoms
+        else:
+            # Already pooled: [batch_size, node_dim] -> [batch_size, 1, node_dim]
+            node_feat_batched = node_feat.unsqueeze(1)
+            node_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=node_feat.device)
+            num_atoms = 1
+
+        # === Step 2: Optional input projection ===
+        if self.use_projection:
+            node_feat_projected = self.node_proj_in(node_feat_batched)  # [batch, num_atoms, hidden]
+            token_feat_projected = self.token_proj_in(text_tokens)      # [batch, seq_len, hidden]
+        else:
+            node_feat_projected = node_feat_batched
+            token_feat_projected = text_tokens
+
+        # === Step 3: Atom-to-Token Attention ===
+        Q_a2t = self.a2t_query(node_feat_projected)  # [batch, num_atoms, hidden]
+        K_a2t = self.a2t_key(token_feat_projected)   # [batch, seq_len, hidden]
+        V_a2t = self.a2t_value(token_feat_projected) # [batch, seq_len, hidden]
+
+        # Multi-head attention
+        Q_a2t = self.split_heads(Q_a2t)  # [batch, heads, num_atoms, head_dim]
+        K_a2t = self.split_heads(K_a2t)  # [batch, heads, seq_len, head_dim]
+        V_a2t = self.split_heads(V_a2t)  # [batch, heads, seq_len, head_dim]
+
+        # Attention scores: [batch, heads, num_atoms, seq_len]
+        attn_scores = torch.matmul(Q_a2t, K_a2t.transpose(-2, -1)) * self.scale
+
+        # Apply token mask if provided (mask out padding tokens)
+        if token_mask is not None:
+            # token_mask: [batch, seq_len] -> [batch, 1, 1, seq_len]
+            token_mask_expanded = token_mask.unsqueeze(1).unsqueeze(2)
+            attn_scores = attn_scores.masked_fill(~token_mask_expanded, float('-inf'))
+
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [batch, heads, num_atoms, seq_len]
+
+        # Store attention weights for visualization
+        if return_attention:
+            self.last_attention_weights = attn_weights.detach()
+
+        attn_weights_dropped = self.dropout(attn_weights)
+
+        # Apply attention: [batch, heads, num_atoms, head_dim]
+        context = torch.matmul(attn_weights_dropped, V_a2t)
+        context = context.permute(0, 2, 1, 3).contiguous()  # [batch, num_atoms, heads, head_dim]
+        context = context.view(batch_size, num_atoms, self.hidden_dim)
+        context = self.output_proj(context)  # [batch, num_atoms, node_dim]
+
+        # === Step 4: Optional gating mechanism (hybrid mode) ===
+        if self.use_gate:
+            gate_input = torch.cat([node_feat_batched, context], dim=-1)
+            gate_values = self.gate(gate_input)  # [batch, num_atoms, node_dim]
+            enhanced_batched = node_feat_batched + gate_values * context
+        else:
+            # Pure attention mode
+            enhanced_batched = node_feat_batched + context
+
+        # === Step 5: Layer norm ===
+        enhanced_batched = self.layer_norm(enhanced_batched)
+        enhanced_batched = self.dropout(enhanced_batched)
+
+        # === Step 6: Convert back to DGL batched format ===
+        if num_nodes != batch_size:
+            # Extract actual nodes back to [total_nodes, node_dim]
+            enhanced = torch.zeros_like(node_feat_orig)
+            start_idx = 0
+            for i, num in enumerate(batch_num_nodes):
+                enhanced[start_idx:start_idx + num] = enhanced_batched[i, :num]
+                start_idx += num
+        else:
+            # Remove the extra dimension: [batch_size, 1, node_dim] -> [batch_size, node_dim]
+            enhanced = enhanced_batched.squeeze(1)
+
+        if return_attention:
+            return enhanced, attn_weights
+        else:
+            return enhanced
+
+
 class CrossModalAttention(nn.Module):
     """Cross-modal attention between graph and text features.
 
@@ -861,6 +1063,11 @@ class ALIGNNConfig(BaseSettings):
     middle_fusion_use_learnable_scale: bool = False  # Use learnable scaling factor for text features
     middle_fusion_initial_scale: float = 1.0  # Initial value for learnable scaling (use 12.0 based on diagnostics)
 
+    # Enhanced middle fusion with attention (for interpretability)
+    use_middle_fusion_attention: bool = False  # Use attention-based middle fusion instead of simple gating
+    middle_fusion_attention_use_gate: bool = True  # Hybrid mode: attention + gate
+    middle_fusion_attention_use_projection: bool = True  # Project text tokens to hidden_dim
+
     # Contrastive learning settings
     use_contrastive_loss: bool = False
     contrastive_loss_weight: float = 0.1
@@ -1064,21 +1271,46 @@ class ALIGNN(nn.Module):
 
         # Middle fusion modules
         self.use_middle_fusion = config.use_middle_fusion
+        self.use_middle_fusion_attention = config.use_middle_fusion_attention
         self.middle_fusion_modules = nn.ModuleDict()
         if self.use_middle_fusion:
             # Parse middle_fusion_layers string to get layer indices
             fusion_layers = [int(x.strip()) for x in config.middle_fusion_layers.split(',')]
-            for layer_idx in fusion_layers:
-                self.middle_fusion_modules[f'layer_{layer_idx}'] = MiddleFusionModule(
-                    node_dim=config.hidden_features,
-                    text_dim=64,  # After text_projection
-                    hidden_dim=config.middle_fusion_hidden_dim,
-                    num_heads=config.middle_fusion_num_heads,
-                    dropout=config.middle_fusion_dropout,
-                    use_gate_norm=config.middle_fusion_use_gate_norm,
-                    use_learnable_scale=config.middle_fusion_use_learnable_scale,
-                    initial_scale=config.middle_fusion_initial_scale
-                )
+
+            # Choose between attention-based or simple gating-based middle fusion
+            if self.use_middle_fusion_attention:
+                print(f"\n{'='*80}")
+                print(f"🔗 中期融合配置: 带注意力的中期融合 (可解释性增强)")
+                print(f"{'='*80}")
+                print(f"融合层: {fusion_layers}")
+                print(f"隐藏维度: {config.middle_fusion_hidden_dim}")
+                print(f"注意力头数: {config.middle_fusion_num_heads}")
+                print(f"混合模式 (注意力+门控): {config.middle_fusion_attention_use_gate}")
+                print(f"{'='*80}\n")
+
+                for layer_idx in fusion_layers:
+                    self.middle_fusion_modules[f'layer_{layer_idx}'] = MiddleFusionWithAttention(
+                        node_dim=config.hidden_features,
+                        text_token_dim=768,  # BERT token dimension (before projection)
+                        hidden_dim=config.middle_fusion_hidden_dim,
+                        num_heads=config.middle_fusion_num_heads,
+                        dropout=config.middle_fusion_dropout,
+                        use_gate=config.middle_fusion_attention_use_gate,
+                        use_projection=config.middle_fusion_attention_use_projection
+                    )
+            else:
+                # Original simple gating-based middle fusion
+                for layer_idx in fusion_layers:
+                    self.middle_fusion_modules[f'layer_{layer_idx}'] = MiddleFusionModule(
+                        node_dim=config.hidden_features,
+                        text_dim=64,  # After text_projection
+                        hidden_dim=config.middle_fusion_hidden_dim,
+                        num_heads=config.middle_fusion_num_heads,
+                        dropout=config.middle_fusion_dropout,
+                        use_gate_norm=config.middle_fusion_use_gate_norm,
+                        use_learnable_scale=config.middle_fusion_use_learnable_scale,
+                        initial_scale=config.middle_fusion_initial_scale
+                    )
             self.middle_fusion_layer_indices = fusion_layers
 
         # Fine-grained cross-modal attention module (atom-token level)
@@ -1246,6 +1478,7 @@ class ALIGNN(nn.Module):
         y = self.edge_embedding(bondlength)
 
         # ALIGNN updates: update node, edge, triplet features
+        middle_fusion_attention_weights = {}  # Store attention weights from middle fusion
         for idx, alignn_layer in enumerate(self.alignn_layers):
             x, y, z = alignn_layer(g, lg, x, y, z)
 
@@ -1253,7 +1486,25 @@ class ALIGNN(nn.Module):
             if self.use_middle_fusion and idx in self.middle_fusion_layer_indices:
                 # Get batch information for proper text broadcasting
                 batch_num_nodes = g.batch_num_nodes().tolist()
-                x = self.middle_fusion_modules[f'layer_{idx}'](x, text_emb, batch_num_nodes)
+
+                if self.use_middle_fusion_attention:
+                    # Attention-based middle fusion (with interpretability)
+                    if return_attention:
+                        x, attn_weights = self.middle_fusion_modules[f'layer_{idx}'](
+                            x, text_tokens, batch_num_nodes,
+                            token_mask=attention_mask.bool(),
+                            return_attention=True
+                        )
+                        middle_fusion_attention_weights[f'layer_{idx}'] = attn_weights
+                    else:
+                        x = self.middle_fusion_modules[f'layer_{idx}'](
+                            x, text_tokens, batch_num_nodes,
+                            token_mask=attention_mask.bool(),
+                            return_attention=False
+                        )
+                else:
+                    # Original simple gating-based middle fusion
+                    x = self.middle_fusion_modules[f'layer_{idx}'](x, text_emb, batch_num_nodes)
 
         # Save features after middle fusion (if requested for ablation studies)
         graph_emb_after_middle = None
@@ -1414,6 +1665,9 @@ class ALIGNN(nn.Module):
                 # Fine-grained attention weights (new!)
                 if fine_grained_attention_weights is not None:
                     output_dict['fine_grained_attention_weights'] = fine_grained_attention_weights
+                # Middle fusion attention weights (new! for interpretability)
+                if middle_fusion_attention_weights:
+                    output_dict['middle_fusion_attention_weights'] = middle_fusion_attention_weights
 
             # Compute contrastive loss if enabled
             if self.use_contrastive_loss and self.training:
